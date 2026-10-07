@@ -1,0 +1,41 @@
+{
+  "name": "pi-dynamic-model-catalog",
+  "version": "0.1.0",
+  "description": "Discover models from OpenAI-compatible gateways so custom pi providers stay live, one refresh per provider",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "models",
+    "openai-compatible",
+    "gateway",
+    "custom-provider"
+  ],
+  "license": "MIT",
+  "author": "pingod <pingod@users.noreply.github.com> (https://github.com/pingod)",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/dynamic-models.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pingod/pi-dynamic-model-catalog.git"
+  },
+  "homepage": "https://github.com/pingod/pi-dynamic-model-catalog#readme",
+  "bugs": {
+    "url": "https://github.com/pingod/pi-dynamic-model-catalog/issues"
+  }
+}
