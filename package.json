@@ -1,6 +1,6 @@
 {
   "name": "pi-dynamic-model-catalog",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discover models from OpenAI-compatible gateways so custom pi providers stay live, refreshing all managed providers per pass",
   "keywords": [
     "pi-package",
