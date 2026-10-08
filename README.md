@@ -104,23 +104,16 @@ Environment variables:
 | Variable | Effect |
 | --- | --- |
 | `PI_DYNAMIC_MODELS_PROVIDERS=id1,id2` | Manage only these providers (may include built-in ids) |
-| `PI_DYNAMIC_MODEL_PROVIDER=id` | Declare which provider is in use |
 | `PI_DYNAMIC_MODELS_TTL_MINUTES=n` | Global freshness window |
 | `PI_DYNAMIC_MODELS_COLD_START=off` | Skip the first fetch at load time |
 
-## One refresh, one provider
+## One refresh, all providers
 
-With several gateways configured, each refresh pass fetches **at most one** of
-them, chosen in this order:
-
-1. the provider named on `/dynamic-models [providerId]`;
-2. the provider in use — session model, then `defaultModel`/`defaultProvider` in
-   settings, then `PI_DYNAMIC_MODEL_PROVIDER`;
-3. if none can be resolved, the provider with the **oldest** catalog, pinned for
-   the whole process so it self-heals without ever fanning out.
-
-Every other provider is served from its persisted catalog with no network access.
-
+Every refresh pass refreshes **all** managed providers. Each provider is gated
+by its own TTL window (default 10 minutes), which only paces repeated passes —
+it never limits which providers are touched. A provider whose gateway is down,
+or whose key cannot be resolved, keeps its last cached catalog, so one dead
+gateway never blocks the others.
 ## Storage and failure behavior
 
 Catalogs persist into `~/.pi/agent/models-store.json`, keyed by provider id with
@@ -166,7 +159,7 @@ reports `model catalog 34 -> 34` (or the cached count on failure).
 ## Prior art
 
 `pi-dynamic-models` on npm does the same core discovery; this package exists for
-the multi-gateway behavior (one provider per refresh, TTL, per-provider `auth` /
+the multi-gateway behavior (all providers per refresh, TTL, per-provider `auth` /
 `endpoints` / `headers` / `defaults` knobs) and for persisting through pi's own
 catalog store instead of a custom cache file.
 

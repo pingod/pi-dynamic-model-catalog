@@ -7,14 +7,12 @@
  * the official custom-provider `refreshModels` hook, so its model list is
  * discovered from the OpenAI-compatible `<baseUrl>/v1/models` instead.
  *
- * Key behavior: one refresh pass touches only the provider in use, so several
- * gateways never fan out to the network at once.
- *   - Resolution order: /dynamic-models argument > session model >
- *     settings defaultProvider/defaultModel > PI_DYNAMIC_MODEL_PROVIDER.
- *   - When nothing can be resolved, each pass still fetches only one provider
- *     (the one with the oldest catalog), which self-heals without fanning out.
- *   - Every other provider reuses its persisted catalog with zero requests.
- *
+ * Key behavior: every refresh pass refreshes all managed providers, each
+ * gated by its own TTL window; the TTL only paces repeated passes, it never
+ * limits the set of providers touched. A provider whose gateway is down or
+ * whose key is missing simply keeps its cached catalog, so one slow or dead
+ * gateway can never block the others (fetches run in parallel and are
+ * awaited individually inside pi's refresh path).
  * Persistence uses Pi's own provider-catalog store ~/.pi/agent/models-store.json
  * (keyed by provider id, with checkedAt): refresh passes write through
  * context.publish({ persist }), the load-time cold start writes the same file and
@@ -29,7 +27,8 @@
  *   2. Interactive startup and a `/model <search>` miss (the allowNetwork pass);
  *   3. Non-interactive calls only run with allowNetwork:false, i.e. cache
  *      restore only;
- *   4. `/dynamic-models [providerId]` forces a refresh.
+ *   4. `/dynamic-models [providerId]` forces a refresh of one provider, or of
+ *      every managed provider when the id is omitted.
  *
  * Per-provider knobs live in models.json under `dynamicModels` (Pi's validator
  * allows unknown keys there):
@@ -43,7 +42,6 @@
  * Environment variables:
  *   PI_DYNAMIC_MODELS_PROVIDERS=id1,id2   manage only these providers (may
  *                                         override the built-in vendor list)
- *   PI_DYNAMIC_MODEL_PROVIDER=id          declare the provider in use
  *   PI_DYNAMIC_MODELS_TTL_MINUTES=n       global freshness window
  *   PI_DYNAMIC_MODELS_COLD_START=off      disable the first fetch at load time
  *
@@ -363,51 +361,6 @@ export default async function dynamicModels(pi: ExtensionAPI): Promise<void> {
 		);
 	}
 
-	let sessionProvider: string | undefined;
-	/** Provider explicitly named by /dynamic-models, allowed past the one-provider gate. */
-	let forcedProvider: string | undefined;
-
-	function settingsDefaultProvider(): string | undefined {
-		try {
-			const settings = pi.getSettings() as { defaultProvider?: string; defaultModel?: string };
-			const fromModel = settings.defaultModel?.includes("/")
-				? settings.defaultModel.slice(0, settings.defaultModel.indexOf("/"))
-				: undefined;
-			const candidate = fromModel ?? settings.defaultProvider;
-			return candidate && specs.some((spec) => spec.id === candidate) ? candidate : undefined;
-		} catch {
-			return undefined;
-		}
-	}
-
-	/** The provider in use; undefined when it cannot be resolved. */
-	function activeProvider(): string | undefined {
-		const forced = process.env.PI_DYNAMIC_MODEL_PROVIDER;
-		if (forced && specs.some((spec) => spec.id === forced)) return forced;
-		if (sessionProvider && specs.some((spec) => spec.id === sessionProvider)) return sessionProvider;
-		return settingsDefaultProvider();
-	}
-
-	/**
-	 * Fallback when the active provider cannot be resolved: the whole process pins
-	 * the single provider with the oldest catalog. It must stay pinned, because
-	 * refreshes are awaited one by one -- after the first fetch its checkedAt is
-	 * newest, so "oldest" would slide to the next provider and one pass would hit
-	 * every gateway.
-	 */
-	let designatedProvider: string | undefined;
-	function designated(): string | undefined {
-		if (designatedProvider) return designatedProvider;
-		let best: { id: string; checkedAt: number } | undefined;
-		for (const spec of specs) {
-			const checkedAt = catalogs.get(spec.id)?.checkedAt ?? 0;
-			if (!best || checkedAt < best.checkedAt || (checkedAt === best.checkedAt && spec.id < best.id)) {
-				best = { id: spec.id, checkedAt };
-			}
-		}
-		designatedProvider = best?.id;
-		return designatedProvider;
-	}
 
 	function currentModels(spec: Spec): ProviderModelConfig[] {
 		return catalogs.get(spec.id)?.models ?? spec.staticModels;
@@ -417,11 +370,6 @@ export default async function dynamicModels(pi: ExtensionAPI): Promise<void> {
 		const cached = currentModels(spec);
 		// The allowNetwork:false pass only restores cache; non-interactive runs stop here.
 		if (!context.allowNetwork) return Promise.resolve(cached);
-		// One refresh admits one provider: the active one, else the oldest catalog, else the named one.
-		if (forcedProvider !== spec.id) {
-			const active = activeProvider();
-			if (active ? active !== spec.id : designated() !== spec.id) return Promise.resolve(cached);
-		}
 		if (!context.force) {
 			const checkedAt = catalogs.get(spec.id)?.checkedAt ?? 0;
 			if (checkedAt && Date.now() - checkedAt < ttlMs(spec.settings)) return Promise.resolve(cached);
@@ -452,42 +400,32 @@ export default async function dynamicModels(pi: ExtensionAPI): Promise<void> {
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => {
-		sessionProvider = ctx.model?.provider;
-	});
-	pi.on("model_select", (event) => {
-		sessionProvider = event.model?.provider;
-	});
 
 	pi.registerCommand("dynamic-models", {
-		description: "Refresh the model catalog of the current provider (/dynamic-models [providerId])",
+		description: "Refresh the model catalogs of all managed providers (/dynamic-models [providerId] for one)",
 		handler: async (args, ctx) => {
-			const target = args.trim() || activeProvider() || designated();
-			if (!target) {
-				ctx.ui.notify("No provider is managed by pi-dynamic-model-catalog", "warning");
+			const named = args.trim();
+			const targets = named ? specs.filter((item) => item.id === named) : specs;
+			if (targets.length === 0) {
+				ctx.ui.notify(
+					named
+						? `${named} is not a provider managed by this extension`
+						: "No provider is managed by pi-dynamic-model-catalog",
+					"warning",
+				);
 				return;
 			}
-			const spec = specs.find((item) => item.id === target);
-			if (!spec) {
-				ctx.ui.notify(`${target} is not a provider managed by this extension`, "warning");
-				return;
-			}
-			const before = currentModels(spec).length;
+			const before = targets.map((spec) => currentModels(spec).length);
 			// Use pi's own refresh path: PI_OFFLINE decides allowNetwork, force bypasses TTL.
-			forcedProvider = target;
-			let result;
-			try {
-				result = await ctx.modelRegistry.refresh({ providers: [target], force: true });
-			} finally {
-				forcedProvider = undefined;
-			}
-			const after = currentModels(spec).length;
+			const result = await ctx.modelRegistry.refresh({ providers: targets.map((spec) => spec.id), force: true });
+			const after = targets.map((spec) => currentModels(spec).length);
+			const summary = targets.map((spec, i) => `${spec.id} ${before[i]} -> ${after[i]}`);
 			if (result.errors.size > 0) {
-				ctx.ui.notify(`${target}: refresh failed, keeping ${after} cached models`, "error");
+				ctx.ui.notify(`refresh failed, keeping cached models: ${summary.join(", ")}`, "error");
 			} else if (result.aborted) {
-				ctx.ui.notify(`${target}: refresh interrupted, keeping ${after} cached models`, "warning");
+				ctx.ui.notify(`refresh interrupted: ${summary.join(", ")}`, "warning");
 			} else {
-				ctx.ui.notify(`${target}: model catalog ${before} -> ${after}`, "info");
+				ctx.ui.notify(`model catalogs ${summary.join(", ")}`, "info");
 			}
 		},
 	});
